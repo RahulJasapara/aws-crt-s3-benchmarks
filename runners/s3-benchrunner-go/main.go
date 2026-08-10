@@ -1,0 +1,105 @@
+// Command s3-benchrunner-go is a benchmark runner for the AWS SDK for Go v2
+// S3 Transfer Manager, part of the aws-crt-s3-benchmarks suite.
+//
+// Usage:
+//
+//	s3-benchrunner-go S3_CLIENT WORKLOAD BUCKET REGION TARGET_THROUGHPUT
+//
+// It reads a workload .run.json file, performs all its tasks (repeating until
+// maxRepeatCount or maxRepeatSecs), and prints one line per run to stderr:
+//
+//	Run:N Secs:X.XXXXXX Gb/s:Y.YYYYYY
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+)
+
+// exitCodeSkip signals to the harness that this runner intentionally skipped
+// the workload (not a failure). Matches the convention used by other runners.
+const exitCodeSkip = 123
+
+func main() {
+	if len(os.Args) < 6 {
+		fmt.Fprintf(os.Stderr,
+			"usage: %s S3_CLIENT WORKLOAD BUCKET REGION TARGET_THROUGHPUT\n", os.Args[0])
+		os.Exit(2)
+	}
+
+	clientID := S3ClientID(os.Args[1])
+	workloadPath := os.Args[2]
+	bucket := os.Args[3]
+	region := os.Args[4]
+	targetThroughput, err := strconv.ParseFloat(os.Args[5], 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid TARGET_THROUGHPUT %q: %v\n", os.Args[5], err)
+		os.Exit(2)
+	}
+
+	switch clientID {
+	case clientTM, clientTMGet:
+	default:
+		fmt.Fprintf(os.Stderr, "unknown S3_CLIENT %q (want %q or %q)\n",
+			clientID, clientTM, clientTMGet)
+		os.Exit(2)
+	}
+
+	workload, err := loadWorkload(workloadPath)
+	if err != nil {
+		// A parse failure most likely means a different schema version.
+		fmt.Fprintf(os.Stderr, "Skipping benchmark - %v\n", err)
+		os.Exit(exitCodeSkip)
+	}
+	if workload.Version != workloadVersion {
+		fmt.Fprintf(os.Stderr, "Skipping benchmark - workload version %d not supported (want %d)\n",
+			workload.Version, workloadVersion)
+		os.Exit(exitCodeSkip)
+	}
+
+	ctx := context.Background()
+	cfg := &BenchmarkConfig{
+		Workload:             workload,
+		Bucket:               bucket,
+		Region:               region,
+		TargetThroughputGbps: targetThroughput,
+	}
+
+	runner, err := NewRunner(ctx, clientID, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed creating runner: %v\n", err)
+		os.Exit(1)
+	}
+
+	gigabitsPerRun := bytesToGigabits(workload.bytesPerRun())
+
+	appStart := time.Now()
+	for runNum := 1; runNum <= workload.MaxRepeatCount; runNum++ {
+		if err := prepareRun(workload); err != nil {
+			fmt.Fprintf(os.Stderr, "failed preparing run %d: %v\n", runNum, err)
+			os.Exit(1)
+		}
+
+		runStart := time.Now()
+		if err := runner.Run(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "run %d failed: %v\n", runNum, err)
+			os.Exit(1)
+		}
+		runSecs := time.Since(runStart).Seconds()
+
+		fmt.Fprintf(os.Stderr, "Run:%d Secs:%.6f Gb/s:%.6f\n",
+			runNum, runSecs, gigabitsPerRun/runSecs)
+
+		if time.Since(appStart).Seconds() >= workload.MaxRepeatSecs {
+			break
+		}
+	}
+}
+
+// bytesToGigabits converts bytes to decimal gigabits (bits / 1e9).
+func bytesToGigabits(b int64) float64 {
+	return float64(b*8) / 1e9
+}

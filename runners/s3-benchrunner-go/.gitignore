@@ -1,0 +1,6 @@
+# Compiled binary
+/s3-benchrunner-go
+
+# Go build/test artifacts
+*.test
+*.out
