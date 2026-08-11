@@ -26,13 +26,14 @@ const (
 	clientTMGet S3ClientID = "sdk-go-tm-get"
 )
 
-// baselineConcurrency is the starting Concurrency for baseline runs.
+// baselineConcurrency is the Concurrency used for benchmark runs.
 //
-// Set to 32 per team guidance (benchmarking on a ~64-vCPU instance). The Go
-// Transfer Manager has no native "target throughput" mode like the CRT/Rust
-// runners, so we map TARGET_THROUGHPUT to Concurrency ourselves here. Keeping
-// this in one function makes it trivial to sweep other values later.
-const baselineConcurrency = 32
+// Set to 64 per team guidance: for now, don't exceed the number of CPUs on the
+// instance (benchmarking on a 64-vCPU c7gn.16xlarge). The Go Transfer Manager
+// has no native "target throughput" mode like the CRT/Rust runners, so we map
+// TARGET_THROUGHPUT to Concurrency ourselves here. Keeping this in one function
+// makes it trivial to sweep other values later.
+const baselineConcurrency = 64
 
 // concurrencyForTargetThroughput derives the Transfer Manager's Concurrency
 // setting from the target throughput. For now this is a fixed baseline; the
