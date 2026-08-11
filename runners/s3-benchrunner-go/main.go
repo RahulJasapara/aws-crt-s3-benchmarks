@@ -41,10 +41,10 @@ func main() {
 	}
 
 	switch clientID {
-	case clientTM, clientTMGet:
+	case clientTM, clientTMGet, clientTMStream:
 	default:
-		fmt.Fprintf(os.Stderr, "unknown S3_CLIENT %q (want %q or %q)\n",
-			clientID, clientTM, clientTMGet)
+		fmt.Fprintf(os.Stderr, "unknown S3_CLIENT %q (want %q, %q, or %q)\n",
+			clientID, clientTM, clientTMGet, clientTMStream)
 		os.Exit(2)
 	}
 

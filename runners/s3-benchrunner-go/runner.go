@@ -22,9 +22,24 @@ type S3ClientID string
 const (
 	// clientTM uses DownloadObject (the io.WriterAt engine).
 	clientTM S3ClientID = "sdk-go-tm"
-	// clientTMGet uses GetObject (the io.Reader engine).
+	// clientTMGet uses GetObject (the io.Reader engine), draining the body
+	// with a single bulk io.Copy.
 	clientTMGet S3ClientID = "sdk-go-tm-get"
+	// clientTMStream uses GetObject (the io.Reader engine) but drains the body
+	// chunk-by-chunk, writing each chunk straight through to the destination.
+	clientTMStream S3ClientID = "sdk-go-tm-stream"
 )
+
+// partSizeBytes is the Transfer Manager part size used for benchmark runs.
+//
+// Pinned to 8 MiB to match the standardized part size used across the other
+// runners (CRT/Rust/Python), so throughput comparisons are apples-to-apples.
+const partSizeBytes = 8 * 1024 * 1024
+
+// streamChunkSize is the read buffer size used by the streaming download path.
+// Each Read fills up to this many bytes, which is then written straight to the
+// destination before the next Read — no user-space buffer accumulates.
+const streamChunkSize = 1024 * 1024
 
 // baselineConcurrency is the Concurrency used for benchmark runs.
 //
@@ -70,6 +85,7 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 	concurrency := concurrencyForTargetThroughput(cfg.TargetThroughputGbps)
 	client := transfermanager.New(s3Client, func(o *transfermanager.Options) {
 		o.Concurrency = concurrency
+		o.PartSizeBytes = partSizeBytes
 	})
 
 	fmt.Fprintf(os.Stderr, "config: client=%s concurrency=%d target=%.1fGb/s region=%s\n",
@@ -163,6 +179,8 @@ func (r *Runner) download(ctx context.Context, task TaskConfig) error {
 	switch r.clientID {
 	case clientTMGet:
 		return r.downloadViaGetObject(ctx, task)
+	case clientTMStream:
+		return r.downloadViaStream(ctx, task)
 	default:
 		return r.downloadViaDownloadObject(ctx, task)
 	}
@@ -182,13 +200,17 @@ func (r *Runner) downloadViaDownloadObject(ctx context.Context, task TaskConfig)
 		w = newDiscardWriterAt()
 	}
 
-	_, err := r.client.DownloadObject(ctx, &transfermanager.DownloadObjectInput{
+	out, err := r.client.DownloadObject(ctx, &transfermanager.DownloadObjectInput{
 		Bucket:   aws.String(r.config.Bucket),
 		Key:      aws.String(task.Key),
 		WriterAt: w,
 	})
 	if err != nil {
 		return fmt.Errorf("failed downloading %q: %w", task.Key, err)
+	}
+	// Guard against a silent partial transfer looking like a fast success.
+	if got := aws.ToInt64(out.ContentLength); got != task.Size {
+		return fmt.Errorf("downloaded %q: got %d bytes, want %d", task.Key, got, task.Size)
 	}
 	return nil
 }
@@ -217,8 +239,78 @@ func (r *Runner) downloadViaGetObject(ctx context.Context, task TaskConfig) erro
 		dst = io.Discard
 	}
 
-	if _, err := io.Copy(dst, out.Body); err != nil {
+	n, err := io.Copy(dst, out.Body)
+	if err != nil {
 		return fmt.Errorf("failed reading body of %q: %w", task.Key, err)
+	}
+	// Guard against a silent partial transfer looking like a fast success.
+	if n != task.Size {
+		return fmt.Errorf("downloaded %q: got %d bytes, want %d", task.Key, n, task.Size)
+	}
+	return nil
+}
+
+// downloadViaStream uses the io.Reader engine (GetObject) but drains the body
+// one chunk at a time, writing each chunk straight to the destination and
+// flushing immediately. Unlike the bulk io.Copy path, no user-space buffer is
+// allowed to accumulate: letting writes buffer builds backpressure that stalls
+// throughput, so each chunk is pushed through before the next Read.
+func (r *Runner) downloadViaStream(ctx context.Context, task TaskConfig) error {
+	out, err := r.client.GetObject(ctx, &transfermanager.GetObjectInput{
+		Bucket: aws.String(r.config.Bucket),
+		Key:    aws.String(task.Key),
+	}, func(o *transfermanager.Options) {
+		o.GetObjectType = types.GetObjectRanges
+	})
+	if err != nil {
+		return fmt.Errorf("failed getting %q: %w", task.Key, err)
+	}
+
+	// dst is the write target; flush is called after each chunk to ensure the
+	// data is pushed through rather than left buffered.
+	var dst io.Writer
+	var flush func() error
+	if r.config.Workload.FilesOnDisk {
+		f, err := os.Create(task.Key)
+		if err != nil {
+			return fmt.Errorf("failed creating file %q: %w", task.Key, err)
+		}
+		defer f.Close()
+		dst = f
+		flush = f.Sync
+	} else {
+		dst = io.Discard
+		flush = func() error { return nil }
+	}
+
+	buf := make([]byte, streamChunkSize)
+	var total int64
+	for {
+		nr, rerr := out.Body.Read(buf)
+		if nr > 0 {
+			nw, werr := dst.Write(buf[:nr])
+			if werr != nil {
+				return fmt.Errorf("failed writing chunk of %q: %w", task.Key, werr)
+			}
+			if nw != nr {
+				return fmt.Errorf("short write on %q: wrote %d of %d bytes", task.Key, nw, nr)
+			}
+			if err := flush(); err != nil {
+				return fmt.Errorf("failed flushing chunk of %q: %w", task.Key, err)
+			}
+			total += int64(nr)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return fmt.Errorf("failed reading body of %q: %w", task.Key, rerr)
+		}
+	}
+
+	// Guard against a silent partial transfer looking like a fast success.
+	if total != task.Size {
+		return fmt.Errorf("downloaded %q: got %d bytes, want %d", task.Key, total, task.Size)
 	}
 	return nil
 }

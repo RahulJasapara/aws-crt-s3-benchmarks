@@ -24,7 +24,10 @@ s3-benchrunner-go S3_CLIENT WORKLOAD BUCKET REGION TARGET_THROUGHPUT
 
 *   `S3_CLIENT`: which download engine to use:
     *   `sdk-go-tm` — `DownloadObject` (the `io.WriterAt` engine)
-    *   `sdk-go-tm-get` — `GetObject` (the `io.Reader` engine)
+    *   `sdk-go-tm-get` — `GetObject` (the `io.Reader` engine), draining the
+        body with a single bulk `io.Copy`
+    *   `sdk-go-tm-stream` — `GetObject` (the `io.Reader` engine), draining the
+        body chunk-by-chunk and flushing each write immediately (no buffering)
 
     (Uploads always use `UploadObject`; the client ID only affects downloads.)
 *   `WORKLOAD`: path to a workload `.run.json` file (see [workloads/](../../workloads))
@@ -44,7 +47,13 @@ which is the single place to change when sweeping concurrency values.
 
 ## Status
 
-Minimal first pass: single-object upload/download in both on-disk and in-memory
-(RAM) modes. Not yet implemented: directory APIs (`UploadDirectory` /
-`DownloadDirectory`), the `--disable-directory` flag, checksum validation, and
-telemetry.
+Single-object upload/download in both on-disk and in-memory (RAM) modes.
+Downloads are benchmarked via three distinct engines: `DownloadObject`
+(`io.WriterAt`), `GetObject` with a bulk `io.Copy`, and `GetObject` with a
+chunk-by-chunk streaming path that flushes each write. The part size is pinned
+to 8 MiB to match the other runners for fair comparison, and every download
+asserts the transferred byte count equals the task size (so a partial transfer
+can't masquerade as a fast success).
+
+Not yet implemented: directory APIs (`UploadDirectory` / `DownloadDirectory`),
+the `--disable-directory` flag, checksum validation, and telemetry.
