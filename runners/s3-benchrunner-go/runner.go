@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,13 +34,14 @@ const (
 // partSizeBytes is the Transfer Manager part size used for benchmark runs.
 //
 // Pinned to 8 MiB to match the standardized part size used across the other
-// runners (CRT/Rust/Python), so throughput comparisons are apples-to-apples.
+// runners (CRT/Rust/C++), so throughput comparisons are apples-to-apples.
 const partSizeBytes = 8 * 1024 * 1024
 
 // streamChunkSize is the read buffer size used by the streaming download path.
-// Each Read fills up to this many bytes, which is then written straight to the
-// destination before the next Read — no user-space buffer accumulates.
-const streamChunkSize = 1024 * 1024
+// Set to the part size so each Read drains a whole part at once: the SDK's
+// concurrentReader spawns a fresh set of worker goroutines on every Read call,
+// so a buffer smaller than the part size multiplies that goroutine churn.
+const streamChunkSize = partSizeBytes
 
 // baselineConcurrency is the Concurrency used for benchmark runs.
 //
@@ -251,10 +253,9 @@ func (r *Runner) downloadViaGetObject(ctx context.Context, task TaskConfig) erro
 }
 
 // downloadViaStream uses the io.Reader engine (GetObject) but drains the body
-// one chunk at a time, writing each chunk straight to the destination and
-// flushing immediately. Unlike the bulk io.Copy path, no user-space buffer is
-// allowed to accumulate: letting writes buffer builds backpressure that stalls
-// throughput, so each chunk is pushed through before the next Read.
+// one chunk at a time, writing each chunk straight to the destination rather
+// than buffering the whole object like the bulk io.Copy path. The reused buffer
+// means no user-space buffer accumulates across the transfer.
 func (r *Runner) downloadViaStream(ctx context.Context, task TaskConfig) error {
 	out, err := r.client.GetObject(ctx, &transfermanager.GetObjectInput{
 		Bucket: aws.String(r.config.Bucket),
@@ -266,10 +267,7 @@ func (r *Runner) downloadViaStream(ctx context.Context, task TaskConfig) error {
 		return fmt.Errorf("failed getting %q: %w", task.Key, err)
 	}
 
-	// dst is the write target; flush is called after each chunk to ensure the
-	// data is pushed through rather than left buffered.
 	var dst io.Writer
-	var flush func() error
 	if r.config.Workload.FilesOnDisk {
 		f, err := os.Create(task.Key)
 		if err != nil {
@@ -277,10 +275,8 @@ func (r *Runner) downloadViaStream(ctx context.Context, task TaskConfig) error {
 		}
 		defer f.Close()
 		dst = f
-		flush = f.Sync
 	} else {
 		dst = io.Discard
-		flush = func() error { return nil }
 	}
 
 	buf := make([]byte, streamChunkSize)
@@ -295,12 +291,9 @@ func (r *Runner) downloadViaStream(ctx context.Context, task TaskConfig) error {
 			if nw != nr {
 				return fmt.Errorf("short write on %q: wrote %d of %d bytes", task.Key, nw, nr)
 			}
-			if err := flush(); err != nil {
-				return fmt.Errorf("failed flushing chunk of %q: %w", task.Key, err)
-			}
 			total += int64(nr)
 		}
-		if rerr == io.EOF {
+		if errors.Is(rerr, io.EOF) {
 			break
 		}
 		if rerr != nil {
