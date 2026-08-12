@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -43,6 +42,12 @@ const partSizeBytes = 8 * 1024 * 1024
 // so a buffer smaller than the part size multiplies that goroutine churn.
 const streamChunkSize = partSizeBytes
 
+// uploadPatternSize is the size of the reusable random buffer that RAM uploads
+// stream from. Deliberately NOT a multiple of partSizeBytes so consecutive
+// parts aren't byte-identical (which could let S3 or the network dedup and
+// flatter the throughput number). ~31 MiB, an arbitrary non-round length.
+const uploadPatternSize = 31 * 1024 * 1024
+
 // baselineConcurrency is the Concurrency used for benchmark runs.
 //
 // Set to 64 per team guidance: for now, don't exceed the number of CPUs on the
@@ -58,6 +63,28 @@ const baselineConcurrency = 64
 // throughput-aware later without touching call sites.
 func concurrencyForTargetThroughput(targetThroughputGbps float64) int {
 	return baselineConcurrency
+}
+
+// taskConcurrencyCap is the fallback ceiling on simultaneously-running tasks
+// when the open-file limit can't be read. Other runners cap this too (Java
+// 1000, C++ hardware_concurrency*5); this is a conservative constant in the
+// same spirit.
+const taskConcurrencyCap = 1000
+
+// maxConcurrentTasks bounds how many workload tasks run at once. Each running
+// task holds an HTTP connection and, for on-disk workloads, an open file, so
+// the limit is derived from RLIMIT_NOFILE (like the Python runner, which uses
+// 40% of it) and capped at taskConcurrencyCap. Falls back to the cap if the
+// limit can't be read.
+func maxConcurrentTasks() int {
+	limit := taskConcurrencyCap
+	if n, ok := fileDescriptorBudget(); ok && n < limit {
+		limit = n
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
 }
 
 // Runner executes a workload against S3 using the Go Transfer Manager.
@@ -99,17 +126,20 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 		client:   client,
 	}
 
-	// For RAM uploads, pre-generate one random buffer big enough for the
-	// largest upload task, so buffer creation isn't measured in the timed run.
+	// For RAM uploads, pre-generate ONE small random pattern buffer (not the
+	// full object). Each upload task streams its bytes from this pattern via a
+	// patternReader, so a 30 GiB RAM upload costs an 8 MiB buffer, not 30 GiB.
+	// Generating it here keeps it out of the timed run.
 	if !cfg.Workload.FilesOnDisk {
-		var maxUpload int64
+		var hasUpload bool
 		for _, t := range cfg.Workload.Tasks {
-			if t.Action == ActionUpload && t.Size > maxUpload {
-				maxUpload = t.Size
+			if t.Action == ActionUpload {
+				hasUpload = true
+				break
 			}
 		}
-		if maxUpload > 0 {
-			r.uploadData = newRandomData(int(maxUpload))
+		if hasUpload {
+			r.uploadData = newRandomData(uploadPatternSize)
 		}
 	}
 
@@ -117,16 +147,27 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 }
 
 // Run performs every task in the workload once, concurrently, and returns the
-// first error encountered.
+// first error encountered. A semaphore bounds how many tasks run at once so
+// large workloads (Caltech256 has 30,608 tasks) don't exhaust file descriptors
+// or connections by launching every transfer simultaneously.
 func (r *Runner) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
 
-	for i := range r.config.Workload.Tasks {
+	tasks := r.config.Workload.Tasks
+	limit := maxConcurrentTasks()
+	if limit > len(tasks) {
+		limit = len(tasks)
+	}
+	sem := make(chan struct{}, limit)
+
+	for i := range tasks {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(task TaskConfig) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			err := r.runTask(ctx, task)
 			if err != nil {
 				mu.Lock()
@@ -135,7 +176,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				mu.Unlock()
 			}
-		}(r.config.Workload.Tasks[i])
+		}(tasks[i])
 	}
 
 	wg.Wait()
@@ -154,23 +195,26 @@ func (r *Runner) runTask(ctx context.Context, task TaskConfig) error {
 }
 
 func (r *Runner) upload(ctx context.Context, task TaskConfig) error {
-	var body io.Reader
+	in := &transfermanager.UploadObjectInput{
+		Bucket: aws.String(r.config.Bucket),
+		Key:    aws.String(task.Key),
+	}
 	if r.config.Workload.FilesOnDisk {
 		f, err := os.Open(task.Key)
 		if err != nil {
 			return fmt.Errorf("failed opening upload file %q: %w", task.Key, err)
 		}
 		defer f.Close()
-		body = f
+		in.Body = f
 	} else {
-		body = bytes.NewReader(r.uploadData[:task.Size])
+		// Stream from the shared random pattern rather than holding the whole
+		// object in memory. The reader is non-seekable, so the SDK relies on
+		// ContentLength for its multipart decisions — set it explicitly.
+		in.Body = newPatternReader(r.uploadData, task.Size)
+		in.ContentLength = aws.Int64(task.Size)
 	}
 
-	_, err := r.client.UploadObject(ctx, &transfermanager.UploadObjectInput{
-		Bucket: aws.String(r.config.Bucket),
-		Key:    aws.String(task.Key),
-		Body:   body,
-	})
+	_, err := r.client.UploadObject(ctx, in)
 	if err != nil {
 		return fmt.Errorf("failed uploading %q: %w", task.Key, err)
 	}
