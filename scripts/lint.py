@@ -2,6 +2,7 @@
 import argparse
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 from utils import run, REPO_DIR, RUNNERS, SCRIPTS_DIR
@@ -72,6 +73,18 @@ def _lint_rust():
     run(['cargo', 'fmt', '--check'])
 
 
+def _lint_go():
+    runner_dir = RUNNERS['go'].dir
+    os.chdir(runner_dir)
+
+    # gofmt -l lists unformatted files and exits 0, so fail if it prints any.
+    result = subprocess.run(['gofmt', '-l', '.'], capture_output=True, text=True)
+    if result.stdout.strip():
+        exit(f'gofmt found unformatted files:\n{result.stdout}')
+
+    run(['go', 'vet', './...'])
+
+
 if __name__ == '__main__':
     args = PARSER.parse_args()
 
@@ -82,6 +95,7 @@ if __name__ == '__main__':
         'python': _lint_python,
         'java': _lint_java,
         'rust': _lint_rust,
+        'go': _lint_go,
     }
     lint_fn = lint_functions[args.lang]
     lint_fn()

@@ -326,6 +326,22 @@ def _build_rust(work_dir: Path, branch: Optional[str]) -> list[str]:
     return [str(runner_src/'target/release/s3-benchrunner-rust')]
 
 
+def _build_go(work_dir: Path, branch: Optional[str]) -> list[str]:
+    """build s3-benchrunner-go"""
+    runner_src = RUNNERS['go'].dir
+    os.chdir(runner_src)
+
+    if branch:
+        print("WARNING: go runner doesn't currently support --branch")
+
+    # go.mod uses local 'replace' directives pointing at ../../../aws-sdk-go-v2,
+    # so this builds against the local SDK checkout (which must sit beside this repo).
+    run(['go', 'build', '-o', 's3-benchrunner-go', '.'])
+
+    # return runner cmd
+    return [str(runner_src/'s3-benchrunner-go')]
+
+
 def _build_s5cmd(work_dir: Path, branch: Optional[str]) -> list[str]:
     """build s5cmd third-party S3 client"""
 
@@ -411,6 +427,7 @@ def build_runner(lang: str, build_root_dir: Path, branch: Optional[str]) -> list
         'python': _build_python,
         'java': _build_java,
         'rust': _build_rust,
+        'go': _build_go,
         's5cmd': _build_s5cmd,
         'rclone': _build_rclone,
     }
