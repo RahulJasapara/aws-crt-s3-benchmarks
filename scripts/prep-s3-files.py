@@ -168,6 +168,10 @@ def prep_bucket(s3, bucket: str, region: str):
                     }
                 })
 
+        elif region == 'us-east-1':
+            # us-east-1 is S3's default region and rejects a LocationConstraint.
+            s3.create_bucket(Bucket=bucket)
+
         else:
             s3.create_bucket(
                 Bucket=bucket,
