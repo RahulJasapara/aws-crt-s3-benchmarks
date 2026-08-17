@@ -27,8 +27,7 @@ s3-benchrunner-go S3_CLIENT WORKLOAD BUCKET REGION TARGET_THROUGHPUT
     *   `sdk-go-tm-get` — `GetObject` (the `io.Reader` engine), draining the
         body with a single bulk `io.Copy`
     *   `sdk-go-tm-stream` — `GetObject` (the `io.Reader` engine), draining the
-        body chunk-by-chunk through a reused buffer rather than buffering the
-        whole object
+        body chunk-by-chunk through a single reused buffer
 
     (Uploads always use `UploadObject`; the client ID only affects downloads.)
 *   `WORKLOAD`: path to a workload `.run.json` file (see [workloads/](../../workloads))
@@ -45,6 +44,12 @@ The Go Transfer Manager has no native "target throughput" mode (unlike the CRT
 and Rust runners). `TARGET_THROUGHPUT` is currently mapped to a fixed
 `Concurrency` baseline in `concurrencyForTargetThroughput` (see `runner.go`),
 which is the single place to change when sweeping concurrency values.
+
+For the `GetObject`-based engines (`sdk-go-tm-get`, `sdk-go-tm-stream`) the SDK's
+in-flight window is `min(Concurrency, GetObjectBufferSize / PartSizeBytes)`, so
+the runner sets `GetObjectBufferSize = Concurrency * PartSizeBytes` — otherwise
+the 50 MiB default would cap those engines at ~6 parts in flight regardless of
+`Concurrency`.
 
 ## Status
 

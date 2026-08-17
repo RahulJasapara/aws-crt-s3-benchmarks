@@ -13,6 +13,7 @@ const workloadVersion = 2
 // TaskAction is the type of transfer a task performs.
 type TaskAction string
 
+// The task actions a workload can request.
 const (
 	ActionUpload   TaskAction = "upload"
 	ActionDownload TaskAction = "download"
@@ -29,9 +30,11 @@ type TaskConfig struct {
 
 // WorkloadConfig is the parsed contents of a .run.json file.
 type WorkloadConfig struct {
-	Version        int          `json:"version"`
-	Comment        string       `json:"comment"`
-	FilesOnDisk    bool         `json:"filesOnDisk"`
+	Version     int    `json:"version"`
+	Comment     string `json:"comment"`
+	FilesOnDisk bool   `json:"filesOnDisk"`
+	// Checksum names an algorithm to validate; not yet implemented (every
+	// current workload sets it to null).
 	Checksum       *string      `json:"checksum"`
 	MaxRepeatCount int          `json:"maxRepeatCount"`
 	MaxRepeatSecs  float64      `json:"maxRepeatSecs"`

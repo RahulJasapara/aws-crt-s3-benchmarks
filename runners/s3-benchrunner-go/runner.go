@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,52 +31,34 @@ const (
 	clientTMStream S3ClientID = "sdk-go-tm-stream"
 )
 
-// partSizeBytes is the Transfer Manager part size used for benchmark runs.
-//
-// Pinned to 8 MiB to match the standardized part size used across the other
-// runners (CRT/Rust/C++), so throughput comparisons are apples-to-apples.
+// partSizeBytes is the Transfer Manager part size. Pinned to 8 MiB to match the
+// other runners (CRT/Rust/C++) so throughput comparisons are apples-to-apples.
 const partSizeBytes = 8 * 1024 * 1024
 
-// streamChunkSize is the read buffer size used by the streaming download path.
-// Set to the part size so each Read drains a whole part at once: the SDK's
-// concurrentReader spawns a fresh set of worker goroutines on every Read call,
-// so a buffer smaller than the part size multiplies that goroutine churn.
+// streamChunkSize is the streaming download read buffer, sized to one part so
+// each Read consumes a whole buffered part at a time.
 const streamChunkSize = partSizeBytes
 
-// uploadPatternSize is the size of the reusable random buffer that RAM uploads
-// stream from. Deliberately NOT a multiple of partSizeBytes so consecutive
-// parts aren't byte-identical (which could let S3 or the network dedup and
-// flatter the throughput number). ~31 MiB, an arbitrary non-round length.
+// uploadPatternSize (~31 MiB) is the reusable RAM-upload source buffer. Not a
+// multiple of partSizeBytes, so consecutive parts differ and can't be deduped.
 const uploadPatternSize = 31 * 1024 * 1024
 
-// baselineConcurrency is the Concurrency used for benchmark runs.
-//
-// Set to 64 per team guidance: for now, don't exceed the number of CPUs on the
-// instance (benchmarking on a 64-vCPU c7gn.16xlarge). The Go Transfer Manager
-// has no native "target throughput" mode like the CRT/Rust runners, so we map
-// TARGET_THROUGHPUT to Concurrency ourselves here. Keeping this in one function
-// makes it trivial to sweep other values later.
+// baselineConcurrency is the fixed Transfer Manager Concurrency for runs (64,
+// matching the 64-vCPU test instance; see concurrencyForTargetThroughput).
 const baselineConcurrency = 64
 
-// concurrencyForTargetThroughput derives the Transfer Manager's Concurrency
-// setting from the target throughput. For now this is a fixed baseline; the
-// targetThroughputGbps argument is accepted so the mapping can be made
-// throughput-aware later without touching call sites.
+// concurrencyForTargetThroughput maps target throughput to Concurrency. Fixed
+// for now; the arg is kept so the mapping can become throughput-aware later.
 func concurrencyForTargetThroughput(targetThroughputGbps float64) int {
 	return baselineConcurrency
 }
 
-// taskConcurrencyCap is the fallback ceiling on simultaneously-running tasks
-// when the open-file limit can't be read. Other runners cap this too (Java
-// 1000, C++ hardware_concurrency*5); this is a conservative constant in the
-// same spirit.
+// taskConcurrencyCap is the hard upper bound on simultaneously-running tasks;
+// the fd-derived budget may lower it but never raise it (cf. Java's 1000).
 const taskConcurrencyCap = 1000
 
-// maxConcurrentTasks bounds how many workload tasks run at once. Each running
-// task holds an HTTP connection and, for on-disk workloads, an open file, so
-// the limit is derived from RLIMIT_NOFILE (like the Python runner, which uses
-// 40% of it) and capped at taskConcurrencyCap. Falls back to the cap if the
-// limit can't be read.
+// maxConcurrentTasks bounds simultaneously-running tasks (each holds fds: a
+// socket, plus a disk file for on-disk workloads): min(fd budget, cap).
 func maxConcurrentTasks() int {
 	limit := taskConcurrencyCap
 	if n, ok := fileDescriptorBudget(); ok && n < limit {
@@ -112,13 +95,22 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 
 	s3Client := s3.NewFromConfig(awsCfg)
 	concurrency := concurrencyForTargetThroughput(cfg.TargetThroughputGbps)
+	// GetObject buffer sets the in-flight window (buffer/partSize parts, capped at
+	// Concurrency); defaults to window==Concurrency, override via GET_BUFFER_MIB.
+	getBufferBytes := int64(concurrency) * partSizeBytes
+	if mib := os.Getenv("GET_BUFFER_MIB"); mib != "" {
+		if v, err := strconv.Atoi(mib); err == nil && v > 0 {
+			getBufferBytes = int64(v) * 1024 * 1024
+		}
+	}
 	client := transfermanager.New(s3Client, func(o *transfermanager.Options) {
 		o.Concurrency = concurrency
 		o.PartSizeBytes = partSizeBytes
+		o.GetObjectBufferSize = getBufferBytes
 	})
 
-	fmt.Fprintf(os.Stderr, "config: client=%s concurrency=%d target=%.1fGb/s region=%s\n",
-		clientID, concurrency, cfg.TargetThroughputGbps, cfg.Region)
+	fmt.Fprintf(os.Stderr, "config: client=%s concurrency=%d partSize=%dMiB getBuf=%dMiB target=%.1fGb/s region=%s\n",
+		clientID, concurrency, partSizeBytes/(1024*1024), getBufferBytes/(1024*1024), cfg.TargetThroughputGbps, cfg.Region)
 
 	r := &Runner{
 		clientID: clientID,
@@ -126,10 +118,8 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 		client:   client,
 	}
 
-	// For RAM uploads, pre-generate ONE small random pattern buffer (not the
-	// full object). Each upload task streams its bytes from this pattern via a
-	// patternReader, so a 30 GiB RAM upload costs an 8 MiB buffer, not 30 GiB.
-	// Generating it here keeps it out of the timed run.
+	// For RAM uploads, pre-generate ONE ~31 MiB pattern buffer (not the full
+	// object); each task streams from it via a patternReader, off the timed path.
 	if !cfg.Workload.FilesOnDisk {
 		var hasUpload bool
 		for _, t := range cfg.Workload.Tasks {
@@ -146,33 +136,38 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 	return r, nil
 }
 
-// Run performs every task in the workload once, concurrently, and returns the
-// first error encountered. A semaphore bounds how many tasks run at once so
-// large workloads (Caltech256 has 30,608 tasks) don't exhaust file descriptors
-// or connections by launching every transfer simultaneously.
+// Run performs every task once, concurrently (bounded by maxConcurrentTasks),
+// and fails fast: the first error cancels the rest and is returned.
 func (r *Runner) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
 
 	tasks := r.config.Workload.Tasks
-	limit := maxConcurrentTasks()
-	if limit > len(tasks) {
-		limit = len(tasks)
-	}
+	limit := min(maxConcurrentTasks(), len(tasks))
 	sem := make(chan struct{}, limit)
 
 	for i := range tasks {
+		mu.Lock()
+		failed := firstErr != nil
+		mu.Unlock()
+		if failed {
+			break // stop launching once a task has failed
+		}
+
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(task TaskConfig) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			err := r.runTask(ctx, task)
-			if err != nil {
+			if err := r.runTask(ctx, task); err != nil {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
+					cancel() // abort in-flight transfers
 				}
 				mu.Unlock()
 			}
@@ -207,9 +202,8 @@ func (r *Runner) upload(ctx context.Context, task TaskConfig) error {
 		defer f.Close()
 		in.Body = f
 	} else {
-		// Stream from the shared random pattern rather than holding the whole
-		// object in memory. The reader is non-seekable, so the SDK relies on
-		// ContentLength for its multipart decisions — set it explicitly.
+		// Stream from the shared pattern instead of buffering the object. The
+		// reader is non-seekable, so set ContentLength for the SDK's multipart sizing.
 		in.Body = newPatternReader(r.uploadData, task.Size)
 		in.ContentLength = aws.Int64(task.Size)
 	}
@@ -296,10 +290,8 @@ func (r *Runner) downloadViaGetObject(ctx context.Context, task TaskConfig) erro
 	return nil
 }
 
-// downloadViaStream uses the io.Reader engine (GetObject) but drains the body
-// one chunk at a time, writing each chunk straight to the destination rather
-// than buffering the whole object like the bulk io.Copy path. The reused buffer
-// means no user-space buffer accumulates across the transfer.
+// downloadViaStream drains the GetObject body through one reused part-sized
+// buffer, writing each chunk straight to dst (no user-space accumulation).
 func (r *Runner) downloadViaStream(ctx context.Context, task TaskConfig) error {
 	out, err := r.client.GetObject(ctx, &transfermanager.GetObjectInput{
 		Bucket: aws.String(r.config.Bucket),
@@ -352,9 +344,8 @@ func (r *Runner) downloadViaStream(ctx context.Context, task TaskConfig) error {
 	return nil
 }
 
-// prepareRun does per-run setup that must happen BEFORE the timer starts:
-// for downloads, remove any stale file and ensure parent dirs exist; for
-// uploads, verify the source file is present.
+// prepareRun does per-run setup before the timer starts: clear stale download
+// files and make parent dirs; for uploads, verify the source exists.
 func prepareRun(w *WorkloadConfig) error {
 	if !w.FilesOnDisk {
 		return nil

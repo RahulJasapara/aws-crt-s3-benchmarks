@@ -6,12 +6,8 @@ import (
 	"syscall"
 )
 
-// newRandomData quickly generates a buffer of random data of the given size.
-//
-// Generating randomness is much slower than copying memory, so we only fill a
-// modest prefix with real randomness and then copy that prefix repeatedly to
-// fill the rest. The prefix length is chosen to not fall on a part boundary so
-// no two parts are identical.
+// newRandomData returns size bytes of pseudo-random data. Only a ~30 MiB prefix
+// is truly random; it is copied forward to fill the rest (copy beats RNG).
 func newRandomData(size int) []byte {
 	data := make([]byte, size)
 
@@ -45,9 +41,8 @@ func (*discardWriterAt) WriteAt(p []byte, _ int64) (int, error) {
 	return len(p), nil
 }
 
-// fileDescriptorBudget returns a safe number of concurrent open files, derived
-// from the soft RLIMIT_NOFILE (40% of it, matching the Python runner). Returns
-// ok=false if the limit can't be read (e.g. Getrlimit unsupported).
+// fileDescriptorBudget returns 40% of the soft RLIMIT_NOFILE (matching the
+// Python runner), or ok=false if the limit can't be read.
 func fileDescriptorBudget() (int, bool) {
 	var lim syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
@@ -56,23 +51,16 @@ func fileDescriptorBudget() (int, bool) {
 	return int(lim.Cur * 4 / 10), true
 }
 
-// patternReader is an io.Reader that synthesizes `size` bytes by repeating a
-// small in-memory pattern, so a huge RAM upload doesn't require allocating the
-// whole object up front (a 30 GiB task would otherwise be a 30 GiB heap alloc).
-//
-// It is deliberately NOT an io.Seeker: the Transfer Manager's UploadObject
-// treats a non-seekable Body as a stream and uses the request's ContentLength
-// for its multipart decisions, which is exactly the streaming path we want to
-// exercise. Each task must use its own patternReader — it carries read state.
+// patternReader repeats a small pattern to produce size bytes without a full-
+// object allocation. Not an io.Seeker (forces the SDK's streaming upload path).
 type patternReader struct {
 	pattern []byte
 	size    int64
 	off     int64 // total bytes already produced
 }
 
-// newPatternReader returns a reader that will produce exactly size bytes drawn
-// from pattern (which must be non-empty). pattern may be shared read-only
-// across readers; the reader never mutates it.
+// newPatternReader returns a reader producing size bytes from pattern (non-empty,
+// shared read-only). Each reader carries its own read state.
 func newPatternReader(pattern []byte, size int64) *patternReader {
 	return &patternReader{pattern: pattern, size: size}
 }
