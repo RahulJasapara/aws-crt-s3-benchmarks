@@ -31,16 +31,12 @@ const (
 	clientTMStream S3ClientID = "sdk-go-tm-stream"
 )
 
-// partSizeBytes is the Transfer Manager part size. Pinned to 8 MiB to match the
-// other runners (CRT/Rust/C++) so throughput comparisons are apples-to-apples.
-const partSizeBytes = 8 * 1024 * 1024
-
-// streamChunkSize is the streaming download read buffer, sized to one part so
-// each Read consumes a whole buffered part at a time.
-const streamChunkSize = partSizeBytes
+// defaultPartSizeBytes is the Transfer Manager part size. 8 MiB matches the other
+// runners (CRT/Rust/C++) for apples-to-apples runs; override via PART_SIZE_MIB.
+const defaultPartSizeBytes = 8 * 1024 * 1024
 
 // uploadPatternSize (~31 MiB) is the reusable RAM-upload source buffer. Not a
-// multiple of partSizeBytes, so consecutive parts differ and can't be deduped.
+// multiple of any swept part size, so consecutive parts differ and can't be deduped.
 const uploadPatternSize = 31 * 1024 * 1024
 
 // baselineConcurrency is the fixed Transfer Manager Concurrency for runs (64,
@@ -75,6 +71,7 @@ type Runner struct {
 	clientID   S3ClientID
 	config     *BenchmarkConfig
 	client     *transfermanager.Client
+	partSize   int64  // resolved part size; also the streaming read buffer size
 	uploadData []byte // pre-generated random data for RAM uploads
 }
 
@@ -104,9 +101,19 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 		}
 		concurrency = n
 	}
+	// Override the part size via PART_SIZE_MIB to sweep request size; S3 requires
+	// >=5 MiB parts for the multipart uploads this also feeds.
+	partSize := int64(defaultPartSizeBytes)
+	if v := os.Getenv("PART_SIZE_MIB"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 5 {
+			return nil, fmt.Errorf("invalid PART_SIZE_MIB %q: want an integer >= 5", v)
+		}
+		partSize = int64(n) * 1024 * 1024
+	}
 	// GetObject buffer sets the in-flight window (buffer/partSize parts, capped at
 	// Concurrency); defaults to window==Concurrency, override via GET_BUFFER_MIB.
-	getBufferBytes := int64(concurrency) * partSizeBytes
+	getBufferBytes := int64(concurrency) * partSize
 	if mib := os.Getenv("GET_BUFFER_MIB"); mib != "" {
 		if v, err := strconv.Atoi(mib); err == nil && v > 0 {
 			getBufferBytes = int64(v) * 1024 * 1024
@@ -114,17 +121,18 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 	}
 	client := transfermanager.New(s3Client, func(o *transfermanager.Options) {
 		o.Concurrency = concurrency
-		o.PartSizeBytes = partSizeBytes
+		o.PartSizeBytes = partSize
 		o.GetObjectBufferSize = getBufferBytes
 	})
 
 	fmt.Fprintf(os.Stderr, "config: client=%s concurrency=%d partSize=%dMiB getBuf=%dMiB target=%.1fGb/s region=%s\n",
-		clientID, concurrency, partSizeBytes/(1024*1024), getBufferBytes/(1024*1024), cfg.TargetThroughputGbps, cfg.Region)
+		clientID, concurrency, partSize/(1024*1024), getBufferBytes/(1024*1024), cfg.TargetThroughputGbps, cfg.Region)
 
 	r := &Runner{
 		clientID: clientID,
 		config:   cfg,
 		client:   client,
+		partSize: partSize,
 	}
 
 	// For RAM uploads, pre-generate ONE ~31 MiB pattern buffer (not the full
@@ -324,7 +332,7 @@ func (r *Runner) downloadViaStream(ctx context.Context, task TaskConfig) error {
 		dst = io.Discard
 	}
 
-	buf := make([]byte, streamChunkSize)
+	buf := make([]byte, r.partSize)
 	var total int64
 	for {
 		nr, rerr := out.Body.Read(buf)
