@@ -95,6 +95,15 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 
 	s3Client := s3.NewFromConfig(awsCfg)
 	concurrency := concurrencyForTargetThroughput(cfg.TargetThroughputGbps)
+	// Override Concurrency via CONCURRENCY to sweep in-flight parallelism; applied
+	// before the buffer sizing below so the GetObject window still tracks it.
+	if v := os.Getenv("CONCURRENCY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("invalid CONCURRENCY %q: want a positive integer", v)
+		}
+		concurrency = n
+	}
 	// GetObject buffer sets the in-flight window (buffer/partSize parts, capped at
 	// Concurrency); defaults to window==Concurrency, override via GET_BUFFER_MIB.
 	getBufferBytes := int64(concurrency) * partSizeBytes
