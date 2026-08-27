@@ -51,6 +51,49 @@ the runner sets `GetObjectBufferSize = Concurrency * PartSizeBytes` — otherwis
 the 50 MiB default would cap those engines at ~6 parts in flight regardless of
 `Concurrency`.
 
+### Environment overrides
+
+These sweep parameters without editing code or changing the harness's fixed
+command line:
+
+| Variable | Effect |
+|---|---|
+| `CONCURRENCY` | Overrides the `Concurrency` derived from `TARGET_THROUGHPUT` |
+| `PART_SIZE_MIB` | Overrides the 8 MiB part size (S3 requires >= 5) |
+| `GET_BUFFER_MIB` | Overrides `GetObjectBufferSize` (default `Concurrency * PartSizeBytes`) |
+| `CPU_PROFILE` | Path to write a pprof CPU profile |
+| `MEM_PROFILE` | Path to write a pprof heap snapshot, taken after the last run |
+
+`PART_SIZE_MIB` does **not** affect `sdk-go-tm` downloads. In the Transfer
+Manager's default `GetObjectParts` mode the download part size comes from the
+object's upload-time part boundaries (the response `ContentLength`), never from
+`PartSizeBytes` — so sweeping it changes nothing for that engine. It does affect
+uploads and the range-based engines.
+
+### Profiling
+
+Set `CPU_PROFILE` to capture where the runner spends CPU. Capture spans every run
+in the workload; idle time between runs burns no CPU and so adds no samples, so a
+multi-repeat workload just yields more data.
+
+```sh
+CPU_PROFILE=/tmp/cpu.pprof CONCURRENCY=768 \
+  ./s3-benchrunner-go sdk-go-tm workload.run.json BUCKET us-east-1 200
+```
+
+Then analyze:
+
+```sh
+go tool pprof -top /tmp/cpu.pprof         # hot functions, by self time
+go tool pprof -top -cum /tmp/cpu.pprof    # by cumulative time (better for I/O paths)
+go tool pprof -http=:8080 /tmp/cpu.pprof  # flame graph in a browser
+```
+
+A Go CPU profile samples user-space stacks, so it accounts for the process's
+**user** CPU time. Kernel time — the `System` figure from `/usr/bin/time -v` — is
+attributed to whichever Go function made the syscall but is not broken down
+further; use `perf` or `strace -c` to go inside it.
+
 ## Status
 
 Single-object upload/download in both on-disk and in-memory (RAM) modes.
