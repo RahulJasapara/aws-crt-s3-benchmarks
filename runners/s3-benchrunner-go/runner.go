@@ -111,6 +111,19 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 		}
 		partSize = int64(n) * 1024 * 1024
 	}
+	// Override the fetch mode via GET_OBJECT_TYPE=ranges. DownloadObject only reads
+	// PartSizeBytes in range mode; the parts default inherits the object's part size.
+	getObjectType := types.GetObjectParts
+	if v := os.Getenv("GET_OBJECT_TYPE"); v != "" {
+		switch v {
+		case "ranges":
+			getObjectType = types.GetObjectRanges
+		case "parts":
+			getObjectType = types.GetObjectParts
+		default:
+			return nil, fmt.Errorf("invalid GET_OBJECT_TYPE %q: want \"parts\" or \"ranges\"", v)
+		}
+	}
 	// GetObject buffer sets the in-flight window (buffer/partSize parts, capped at
 	// Concurrency); defaults to window==Concurrency, override via GET_BUFFER_MIB.
 	getBufferBytes := int64(concurrency) * partSize
@@ -123,10 +136,11 @@ func NewRunner(ctx context.Context, clientID S3ClientID, cfg *BenchmarkConfig) (
 		o.Concurrency = concurrency
 		o.PartSizeBytes = partSize
 		o.GetObjectBufferSize = getBufferBytes
+		o.GetObjectType = getObjectType
 	})
 
-	fmt.Fprintf(os.Stderr, "config: client=%s concurrency=%d partSize=%dMiB getBuf=%dMiB target=%.1fGb/s region=%s\n",
-		clientID, concurrency, partSize/(1024*1024), getBufferBytes/(1024*1024), cfg.TargetThroughputGbps, cfg.Region)
+	fmt.Fprintf(os.Stderr, "config: client=%s concurrency=%d partSize=%dMiB getBuf=%dMiB getType=%s target=%.1fGb/s region=%s\n",
+		clientID, concurrency, partSize/(1024*1024), getBufferBytes/(1024*1024), getObjectType, cfg.TargetThroughputGbps, cfg.Region)
 
 	r := &Runner{
 		clientID: clientID,
